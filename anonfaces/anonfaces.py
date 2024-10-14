@@ -143,6 +143,18 @@ def get_video_pix_fmt_ffmpeg(video_path):
         print(f'Error retrieving pixel format: {e.stderr.decode()}')
     return None
 
+
+def has_audio_stream_ffmpeg(video_path):
+    try:
+        # Probe video to get metadata
+        probe = ffmpeg.probe(video_path)
+        # Check if any stream is of type 'audio'
+        audio_stream = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
+        return audio_stream
+    except ffmpeg.Error as e:
+        print(f'Error checking for audio stream: {e.stderr.decode()}')
+        return False
+
 def video_detect(
         ipath: str,
         opath: str,
@@ -227,22 +239,7 @@ def video_detect(
         '-level', '3.1',           # Set level if needed
     ])
 
-    # Check for audio stream
-    def has_audio_stream(video_path):
-        cmd = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'a',
-            '-show_entries', 'stream=index',
-            '-of', 'csv=p=0',
-            video_path
-        ]
-        try:
-            output = subprocess.check_output(cmd).decode().strip()
-            return bool(output)
-        except Exception:
-            return False
-
-    has_audio = has_audio_stream(ipath)
+    has_audio = has_audio_stream_ffmpeg(ipath)
 
     # Handle audio settings
     if keep_audio and has_audio:
