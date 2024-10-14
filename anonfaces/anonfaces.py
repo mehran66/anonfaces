@@ -16,6 +16,8 @@ from moviepy.editor import *
 from pedalboard import *
 from pedalboard.io import AudioFile
 from tqdm import tqdm
+from io import BytesIO
+import ffmpeg
 try:
     from centerface import CenterFace  # Import when running as a standalone script
 except ImportError:
@@ -118,6 +120,28 @@ def cam_read_iter(reader):
     while True:
         yield reader.get_next_data()
 
+def get_video_bitrate_ffmpeg(video_path):
+    try:
+        probe = ffmpeg.probe(video_path)
+        video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+        if video_stream and 'bit_rate' in video_stream:
+            return int(video_stream['bit_rate'])
+    except ffmpeg.Error as e:
+        print(f"Error retrieving bitrate: {e.stderr.decode()}")
+    return None
+
+def get_video_pix_fmt_ffmpeg(video_path):
+    try:
+        # Probe video to get metadata
+        probe = ffmpeg.probe(video_path)
+        # Find the first video stream
+        video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+        # Check if the pixel format is available in the video stream metadata
+        if video_stream and 'pix_fmt' in video_stream:
+            return video_stream['pix_fmt']
+    except ffmpeg.Error as e:
+        print(f'Error retrieving pixel format: {e.stderr.decode()}')
+    return None
 
 def video_detect(
         ipath: str,
@@ -180,46 +204,14 @@ def video_detect(
     _ffmpeg_config.setdefault('ffmpeg_params', [])
     _ffmpeg_config['ffmpeg_params'].extend(['-map_metadata', '0', '-map', '0'])
 
-    # Set pixel format
-    def get_video_pix_fmt(video_path):
-        cmd = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=pix_fmt',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_path
-        ]
-        try:
-            output = subprocess.check_output(cmd).decode().strip()
-            return output
-        except Exception as e:
-            print(f'Error retrieving pixel format: {e}')
-            return None
-
-    pix_fmt = get_video_pix_fmt(ipath)
+    pix_fmt = get_video_pix_fmt_ffmpeg(ipath)
     common_pix_fmts = ['yuv420p', 'yuvj420p', 'nv12']
     if pix_fmt in common_pix_fmts:
         _ffmpeg_config['ffmpeg_params'].extend(['-pix_fmt', pix_fmt])
     else:
         _ffmpeg_config['ffmpeg_params'].extend(['-pix_fmt', 'yuv420p'])
 
-    # Get Input Video Bitrate Using ffprobe
-    def get_video_bitrate(video_path):
-        cmd = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=bit_rate',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_path
-        ]
-        try:
-            output = subprocess.check_output(cmd).decode().strip()
-            bitrate = int(output)
-            return bitrate
-        except Exception as e:
-            return None
-
-    input_video_bitrate = get_video_bitrate(ipath)
+    input_video_bitrate = get_video_bitrate_ffmpeg(ipath)
     if input_video_bitrate:
         bitrate_kbps = input_video_bitrate // 1000
         _ffmpeg_config['bitrate'] = f'{bitrate_kbps}k'
@@ -360,7 +352,7 @@ def combine_video_audio(v_path: str, a_path: str, o_path: str):
 
     vclip.audio = aclip
     vclip.write_videofile(o_path, codec="libx264", logger=None)
-    
+
 def distort_now(ipath, opath):
 
     # Add "_distorted" to the output file name
@@ -378,11 +370,11 @@ def distort_now(ipath, opath):
 
     # Combine the processed audio with the original video
     combine_video_audio(opath, DISTORTED_AUDIO, dopath)
-    
+
     # Remove temporary audio files
     os.remove(EXTRACTED_AUDIO)
     os.remove(DISTORTED_AUDIO)
-    
+
 
 def image_detect(
         ipath: str,
@@ -399,7 +391,7 @@ def image_detect(
         mosaicsize: int = 20,
 ):
     frame = imageio.imread(ipath)
-    
+
     if keep_metadata:
         # Source image EXIF metadata retrieval via imageio V3 lib
         metadata = imageio.v3.immeta(ipath)
@@ -420,7 +412,7 @@ def image_detect(
             cv2.destroyAllWindows()
 
     imageio.imsave(opath, frame)
-    
+
     if keep_metadata:
         # Save image with EXIF metadata
         imageio.imsave(opath, frame, exif=exif_dict)
@@ -544,16 +536,16 @@ def parse_cli_args():
     if args.show_both:
         args.show_ffmpeg_command = True
         args.show_ffmpeg_config = True
-    
+
     # Automatically enable keep_audio if distort_audio is set
     if args.distort_audio:
         args.keep_audio = True
-    
+
     if args.keep_audio and args.copy_acodec:
         tqdm.write("")
         tqdm.write("Error: '--keep-audio' and '--copy-acodec' cannot be used together. Please choose one.")
         exit(1)
-    
+
     if len(args.input) == 0:
         parser.print_help()
         tqdm.write('\nPlease supply at least one input path.')
@@ -569,7 +561,7 @@ def parse_cli_args():
 def main():
     args = parse_cli_args()
     ipaths = []
-    
+
     # add files in folders
     for path in args.input:
         if os.path.isdir(path):
@@ -629,6 +621,7 @@ def main():
         print()
         if opath is None and not enable_preview:
             tqdm.write('No output file is specified and the preview GUI is disabled. No output will be produced.')
+
         if filetype == 'video' or is_cam:
             video_detect(
                 ipath=ipath,
