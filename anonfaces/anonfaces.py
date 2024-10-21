@@ -3,111 +3,229 @@
 import argparse
 import json
 import mimetypes
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import shutil
-import tqdm
+from io import BytesIO
+
 import skimage.draw
 import numpy as np
 import imageio.plugins.ffmpeg
 import cv2
-import subprocess
 import signal
 from moviepy.editor import *
 from pedalboard import *
 from pedalboard.io import AudioFile
 from tqdm import tqdm
-from io import BytesIO
 import ffmpeg
+from PIL import Image
+
 try:
     from centerface import CenterFace  # Import when running as a standalone script
 except ImportError:
     from anonfaces.centerface import CenterFace  # Import when used as a library
 
-# Sends a signal to stop ffmpeg
+# Global flag to indicate when to stop processing
 stop_ffmpeg = False
 
 def signal_handler(signum, frame):
+    """
+    Signal handler function to handle interruption signals (e.g., Ctrl+C).
+    Sets the global 'stop_ffmpeg' flag to True to signal that processing should stop.
+    """
     global stop_ffmpeg
     stop_ffmpeg = True
-    tqdm.write(f"")
+    # Write messages to the console using tqdm to avoid interfering with progress bars
+    tqdm.write("")  # Add an empty line for spacing
     tqdm.write("Stop signal received, stopping cleanly...")
-    tqdm.write(f"")
+    tqdm.write("")  # Add another empty line for spacing
 
+# Register the signal handler for SIGINT (Ctrl+C)
 signal.signal(signal.SIGINT, signal_handler)
 
-
 def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
-    s = mask_scale - 1.0
-    h, w = y2 - y1, x2 - x1
-    y1 -= h * s
-    y2 += h * s
-    x1 -= w * s
-    x2 += w * s
+    """
+    Scales a bounding box by a given mask_scale factor.
+
+    Parameters:
+    - x1, y1: Coordinates of the top-left corner of the bounding box.
+    - x2, y2: Coordinates of the bottom-right corner of the bounding box.
+    - mask_scale: Scaling factor for the bounding box. Default is 1.0 (no scaling).
+
+    Returns:
+    - A NumPy array containing the scaled bounding box coordinates [x1, y1, x2, y2], rounded to integers.
+    """
+    if mask_scale == 1.0:
+        # No scaling needed; return original coordinates
+        return np.array([x1, y1, x2, y2], dtype=int)
+
+    # Calculate the amount to expand or shrink the bounding box
+    scale_offset = (mask_scale - 1.0) / 2.0
+
+    # Compute the width and height of the original bounding box
+    width = x2 - x1
+    height = y2 - y1
+
+    # Adjust the bounding box coordinates based on the scaling factor
+    x1 -= width * scale_offset
+    y1 -= height * scale_offset
+    x2 += width * scale_offset
+    y2 += height * scale_offset
+
+    # Round the coordinates to the nearest integer
     return np.round([x1, y1, x2, y2]).astype(int)
 
-
 def draw_det(
-        frame, score, det_idx, x1, y1, x2, y2,
+        frame,
+        score,
+        det_idx,
+        x1, y1, x2, y2,
         replacewith: str = 'blur',
         ellipse: bool = True,
         draw_scores: bool = False,
-        ovcolor: Tuple[int] = (0, 0, 0),
-        replaceimg = None,
+        ovcolor: Tuple[int, int, int] = (0, 0, 0),
+        replaceimg=None,
         mosaicsize: int = 20
 ):
+    """
+    Applies an anonymization effect to a detected bounding box in the frame.
+
+    Parameters:
+    - frame: The image frame (NumPy array) to modify.
+    - score: The confidence score of the detection.
+    - det_idx: The index of the detection (not used in this function).
+    - x1, y1: Coordinates of the top-left corner of the bounding box.
+    - x2, y2: Coordinates of the bottom-right corner of the bounding box.
+    - replacewith: Method of anonymization ('solid', 'blur', 'img', 'mosaic', 'none').
+    - ellipse: If True, apply effects within an elliptical mask inside the bounding box.
+    - draw_scores: If True, draw the detection score near the bounding box.
+    - ovcolor: Color for 'solid' replacement (BGR tuple).
+    - replaceimg: Image to use for 'img' replacement (NumPy array).
+    - mosaicsize: Size of mosaic blocks for 'mosaic' replacement.
+
+    Returns:
+    - None. The function modifies the frame in place.
+    """
     if replacewith == 'solid':
+        # Draw a solid rectangle over the bounding box area with the specified color
         cv2.rectangle(frame, (x1, y1), (x2, y2), ovcolor, -1)
     elif replacewith == 'blur':
-        bf = 2  # blur factor (number of pixels in each dimension that the face will be reduced to)
-        blurred_box =  cv2.blur(
+        # Blur the bounding box area
+        bf = 2  # Blur factor (number of pixels in each dimension that the face will be reduced to)
+        # Apply blur to the ROI (Region of Interest)
+        blurred_box = cv2.blur(
             frame[y1:y2, x1:x2],
             (abs(x2 - x1) // bf, abs(y2 - y1) // bf)
         )
         if ellipse:
+            # If ellipse is True, apply the effect within an elliptical mask
             roibox = frame[y1:y2, x1:x2]
             # Get y and x coordinate lists of the "bounding ellipse"
-            ey, ex = skimage.draw.ellipse((y2 - y1) // 2, (x2 - x1) // 2, (y2 - y1) // 2, (x2 - x1) // 2)
+            ey, ex = skimage.draw.ellipse(
+                (y2 - y1) // 2,
+                (x2 - x1) // 2,
+                (y2 - y1) // 2,
+                (x2 - x1) // 2
+            )
+            # Apply the blurred effect within the ellipse
             roibox[ey, ex] = blurred_box[ey, ex]
+            # Update the frame with the modified ROI
             frame[y1:y2, x1:x2] = roibox
         else:
+            # Replace the ROI in the frame with the blurred version
             frame[y1:y2, x1:x2] = blurred_box
     elif replacewith == 'img':
+        # Replace the bounding box area with a provided image
         target_size = (x2 - x1, y2 - y1)
+        # Resize the replacement image to match the target size
         resized_replaceimg = cv2.resize(replaceimg, target_size)
         if replaceimg.shape[2] == 3:  # RGB
+            # Replace the ROI in the frame with the resized image
             frame[y1:y2, x1:x2] = resized_replaceimg
         elif replaceimg.shape[2] == 4:  # RGBA
-            frame[y1:y2, x1:x2] = frame[y1:y2, x1:x2] * (1 - resized_replaceimg[:, :, 3:] / 255) + resized_replaceimg[:, :, :3] * (resized_replaceimg[:, :, 3:] / 255)
+            # Handle images with an alpha channel
+            alpha_channel = resized_replaceimg[:, :, 3:] / 255
+            color_img = resized_replaceimg[:, :, :3]
+            roi = frame[y1:y2, x1:x2]
+            # Blend the replacement image with the ROI using the alpha channel
+            frame[y1:y2, x1:x2] = roi * (1 - alpha_channel) + color_img * alpha_channel
     elif replacewith == 'mosaic':
+        # Apply a mosaic effect to the bounding box area
         for y in range(y1, y2, mosaicsize):
             for x in range(x1, x2, mosaicsize):
                 pt1 = (x, y)
-                pt2 = (min(x2, x + mosaicsize - 1), min(y2, y + mosaicsize - 1))
-                color = (int(frame[y, x][0]), int(frame[y, x][1]), int(frame[y, x][2]))
+                pt2 = (
+                    min(x2, x + mosaicsize - 1),
+                    min(y2, y + mosaicsize - 1)
+                )
+                # Get the color from the top-left pixel of the block
+                color = (
+                    int(frame[y, x][0]),
+                    int(frame[y, x][1]),
+                    int(frame[y, x][2])
+                )
+                # Draw the mosaic block with the selected color
                 cv2.rectangle(frame, pt1, pt2, color, -1)
     elif replacewith == 'none':
+        # Do nothing; leave the bounding box area unchanged
         pass
     if draw_scores:
+        # Draw the detection score near the bounding box
         cv2.putText(
-            frame, f'{score:.2f}', (x1 + 0, y1 - 20),
-            cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 0)
+            frame,
+            f'{score:.2f}',
+            (x1 + 0, y1 - 20),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.5,
+            (0, 255, 0)
         )
 
-
 def anonymize_frame(
-        dets, frame, mask_scale,
-        replacewith, ellipse, draw_scores, replaceimg, mosaicsize
+        dets,
+        frame,
+        mask_scale,
+        replacewith,
+        ellipse,
+        draw_scores,
+        replaceimg,
+        mosaicsize
 ):
+    """
+    Applies anonymization effects to detected faces in a frame.
+
+    Parameters:
+    - dets: List of detections, where each detection is an array containing bounding box coordinates and a confidence score.
+    - frame: The image frame (NumPy array) to modify.
+    - mask_scale: Scaling factor for the bounding boxes.
+    - replacewith: Method of anonymization ('solid', 'blur', 'img', 'mosaic', 'none').
+    - ellipse: If True, apply effects within an elliptical mask inside the bounding box.
+    - draw_scores: If True, draw the detection scores near the bounding boxes.
+    - replaceimg: Image to use for 'img' replacement (NumPy array).
+    - mosaicsize: Size of mosaic blocks for 'mosaic' replacement.
+
+    Returns:
+    - None. The function modifies the frame in place.
+    """
     for i, det in enumerate(dets):
+        # Extract bounding box coordinates and score from the detection
         boxes, score = det[:4], det[4]
         x1, y1, x2, y2 = boxes.astype(int)
+
+        # Scale the bounding box according to mask_scale
         x1, y1, x2, y2 = scale_bb(x1, y1, x2, y2, mask_scale)
-        # Clip bb coordinates to valid frame region
+
+        # Clip bounding box coordinates to valid frame region
         y1, y2 = max(0, y1), min(frame.shape[0] - 1, y2)
         x1, x2 = max(0, x1), min(frame.shape[1] - 1, x2)
 
+        # Apply the anonymization effect to the bounding box area
         draw_det(
-            frame, score, i, x1, y1, x2, y2,
+            frame,
+            score,
+            i,
+            x1,
+            y1,
+            x2,
+            y2,
             replacewith=replacewith,
             ellipse=ellipse,
             draw_scores=draw_scores,
@@ -117,43 +235,71 @@ def anonymize_frame(
 
 
 def cam_read_iter(reader):
+    """
+    Generator function to continuously read frames from a camera or video reader.
+
+    Parameters:
+    - reader: An object with a method `get_next_data()` that returns the next frame.
+
+    Yields:
+    - Next frame from the reader.
+    """
     while True:
+        # Yield the next frame from the reader
         yield reader.get_next_data()
 
-def get_video_bitrate_ffmpeg(video_path):
-    try:
-        probe = ffmpeg.probe(video_path)
-        video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
-        if video_stream and 'bit_rate' in video_stream:
-            return int(video_stream['bit_rate'])
-    except ffmpeg.Error as e:
-        print(f"Error retrieving bitrate: {e.stderr.decode()}")
-    return None
+def get_video_metadata(ipath):
+    """
+    Retrieves metadata from a video file using FFmpeg.
 
-def get_video_pix_fmt_ffmpeg(video_path):
-    try:
-        # Probe video to get metadata
-        probe = ffmpeg.probe(video_path)
-        # Find the first video stream
-        video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
-        # Check if the pixel format is available in the video stream metadata
-        if video_stream and 'pix_fmt' in video_stream:
-            return video_stream['pix_fmt']
-    except ffmpeg.Error as e:
-        print(f'Error retrieving pixel format: {e.stderr.decode()}')
-    return None
+    Parameters:
+    - ipath: Path to the input video file.
 
-
-def has_audio_stream_ffmpeg(video_path):
+    Returns:
+    - metadata: A dictionary containing video metadata such as bit rate, pixel format, dimensions, codec name, average frame rate, duration, and whether it has an audio stream.
+      Returns None if no video stream is found or an error occurs.
+    """
     try:
-        # Probe video to get metadata
-        probe = ffmpeg.probe(video_path)
-        # Check if any stream is of type 'audio'
-        audio_stream = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
-        return audio_stream
+        # Probe the video file to get metadata
+        probe = ffmpeg.probe(ipath)
+
+        # Extract video streams from the probe data
+        video_streams = [
+            stream for stream in probe['streams']
+            if stream['codec_type'] == 'video'
+        ]
+
+        if not video_streams:
+            print(f"No video stream found in {ipath}")
+            return None
+
+        # Get the first video stream
+        video_stream = video_streams[0]
+
+        # Build the metadata dictionary
+        metadata = {
+            'bit_rate': int(video_stream.get('bit_rate', 0)),
+            'pix_fmt': video_stream.get('pix_fmt', ''),
+            'width': int(video_stream.get('width', 0)),
+            'height': int(video_stream.get('height', 0)),
+            'codec_name': video_stream.get('codec_name', ''),
+            'avg_frame_rate': video_stream.get('avg_frame_rate', '0/0'),
+            'duration': float(video_stream.get('duration', 0.0)),
+        }
+
+        # Check for audio streams
+        audio_streams = [
+            stream for stream in probe['streams']
+            if stream['codec_type'] == 'audio'
+        ]
+        metadata['has_audio'] = len(audio_streams) > 0
+
+        return metadata
+
     except ffmpeg.Error as e:
-        print(f'Error checking for audio stream: {e.stderr.decode()}')
-        return False
+        # Handle exceptions and print the error message
+        print(f"Error retrieving metadata from {ipath}: {e.stderr.decode()}")
+        return None
 
 def video_detect(
         ipath: str,
@@ -175,6 +321,15 @@ def video_detect(
         show_ffmpeg_config: bool = False,
         show_ffmpeg_command: bool = False,
 ):
+    metadata = get_video_metadata(ipath)
+    if metadata is None:
+        print(f"Could not retrieve metadata from {ipath}")
+        return
+
+    # Extract metadata values
+    bit_rate = metadata['bit_rate']
+    pix_fmt = metadata['pix_fmt']
+    has_audio = metadata['has_audio']
 
     # Handle camera input
     if cam:
@@ -212,20 +367,17 @@ def video_detect(
     _ffmpeg_config = ffmpeg_config.copy()
     _ffmpeg_config['fps'] = fps
     _ffmpeg_config.setdefault('ffmpeg_log_level', 'panic')
-
     _ffmpeg_config.setdefault('ffmpeg_params', [])
     _ffmpeg_config['ffmpeg_params'].extend(['-map_metadata', '0', '-map', '0'])
 
-    pix_fmt = get_video_pix_fmt_ffmpeg(ipath)
     common_pix_fmts = ['yuv420p', 'yuvj420p', 'nv12']
     if pix_fmt in common_pix_fmts:
         _ffmpeg_config['ffmpeg_params'].extend(['-pix_fmt', pix_fmt])
     else:
         _ffmpeg_config['ffmpeg_params'].extend(['-pix_fmt', 'yuv420p'])
 
-    input_video_bitrate = get_video_bitrate_ffmpeg(ipath)
-    if input_video_bitrate:
-        bitrate_kbps = input_video_bitrate // 1000
+    if bit_rate:
+        bitrate_kbps = bit_rate // 1000
         _ffmpeg_config['bitrate'] = f'{bitrate_kbps}k'
     else:
         # Set default bitrate if extraction fails
@@ -238,8 +390,6 @@ def video_detect(
         '-profile:v', 'baseline',  # Match input video's profile
         '-level', '3.1',           # Set level if needed
     ])
-
-    has_audio = has_audio_stream_ffmpeg(ipath)
 
     # Handle audio settings
     if keep_audio and has_audio:
@@ -321,42 +471,93 @@ def video_detect(
     bar.close()
 
 
-
 EXTRACTED_AUDIO = "extracted_audio.wav"
 DISTORTED_AUDIO = "distorted_audio.wav"
 
 
 def extract_audio_from_video(v_path: str, a_path: str):
+    """
+    Extracts the audio track from a video file and saves it as an audio file.
+
+    Parameters:
+    - v_path: Path to the input video file.
+    - a_path: Path where the extracted audio file will be saved.
+
+    Returns:
+    - None
+    """
     video = VideoFileClip(v_path)
     video.audio.write_audiofile(a_path)
 
 def distort_audio(audio_input: str, audio_output: str, sample_rate: float = 44100.0):
+    """
+    Applies distortion effects to an audio file and saves the processed audio.
+
+    Parameters:
+    - audio_input: Path to the input audio file.
+    - audio_output: Path where the distorted audio file will be saved.
+    - sample_rate: The sample rate to use for processing (default: 44100.0 Hz).
+
+    Returns:
+    - None
+    """
+    # Read the audio file and resample if necessary
     with AudioFile(audio_input).resampled_to(sample_rate) as f:
         audio = f.read(f.frames)
 
+    # Define the audio effects to apply
     board = Pedalboard([
         Gain(gain_db=5),
         PitchShift(semitones=-2.5),
     ])
+
+    # Apply the effects to the audio
     d_audio = board(audio, sample_rate)
 
+    # Write the processed audio to the output file
     with AudioFile(audio_output, 'w', sample_rate, d_audio.shape[0]) as f:
         f.write(d_audio)
 
+
 def combine_video_audio(v_path: str, a_path: str, o_path: str):
+    """
+    Combines a video file with an audio file, replacing the video's original audio.
+
+    Parameters:
+    - v_path: Path to the input video file.
+    - a_path: Path to the input audio file.
+    - o_path: Path where the output video file will be saved.
+
+    Returns:
+    - None
+    """
+    # Load the video and audio clips
     vclip = VideoFileClip(v_path)
     aclip = AudioFileClip(a_path)
 
+    # Set the video's audio to the new audio clip
     vclip.audio = aclip
+
+    # Write the combined video to the output file
     vclip.write_videofile(o_path, codec="libx264", logger=None)
 
-def distort_now(ipath, opath):
 
+def distort_now(ipath: str, opath: str):
+    """
+    Processes a video file by distorting its audio track and saving the result.
+
+    Parameters:
+    - ipath: Path to the input video file.
+    - opath: Path to the original output video file (before distortion).
+
+    Returns:
+    - None
+    """
     # Add "_distorted" to the output file name
     root, ext = os.path.splitext(opath)
     dopath = f"{root}_distorted{ext}"
 
-    # Copy opath to dopath
+    # Copy the original output video to the new distorted output path
     shutil.copy(opath, dopath)
 
     # Extract audio from the original video
@@ -365,7 +566,7 @@ def distort_now(ipath, opath):
     # Distort the extracted audio
     distort_audio(EXTRACTED_AUDIO, DISTORTED_AUDIO)
 
-    # Combine the processed audio with the original video
+    # Combine the processed audio with the copied video
     combine_video_audio(opath, DISTORTED_AUDIO, dopath)
 
     # Remove temporary audio files
@@ -374,8 +575,7 @@ def distort_now(ipath, opath):
 
 
 def image_detect(
-        ipath: str,
-        opath: str,
+        image_bytes: bytes,
         centerface: CenterFace,
         threshold: float,
         replacewith: str,
@@ -384,37 +584,99 @@ def image_detect(
         draw_scores: bool,
         enable_preview: bool,
         keep_metadata: bool,
-        replaceimg = None,
+        replaceimg=None,
         mosaicsize: int = 20,
+        input_format: Optional[str] = None
 ):
-    frame = imageio.imread(ipath)
+    """
+    Detects faces in an image and applies anonymization effects.
 
-    if keep_metadata:
-        # Source image EXIF metadata retrieval via imageio V3 lib
-        metadata = imageio.v3.immeta(ipath)
-        exif_dict = metadata.get("exif", None)
+    Parameters:
+    - image_bytes: The image data in bytes.
+    - centerface: An instance of the CenterFace face detection model.
+    - threshold: The confidence threshold for face detection.
+    - replacewith: The anonymization method ('solid', 'blur', 'img', 'mosaic', 'none').
+    - mask_scale: Scaling factor for the bounding boxes.
+    - ellipse: If True, apply effects within an elliptical mask inside the bounding box.
+    - draw_scores: If True, draw the detection scores near the bounding boxes.
+    - enable_preview: If True, display a preview window showing the anonymized image.
+    - keep_metadata: If True, preserve the original image metadata.
+    - replaceimg: Image to use for 'img' replacement (NumPy array or PIL Image).
+    - mosaicsize: Size of mosaic blocks for 'mosaic' replacement.
+    - input_format: The format of the input image (e.g., 'JPEG', 'PNG'). If None, it will be inferred.
 
-    # Perform network inference, get bb dets but discard landmark predictions
-    dets, _ = centerface(frame, threshold=threshold)
+    Returns:
+    - output_image_bytes: The anonymized image data in bytes.
+    """
+    # Read the image from bytes using PIL to preserve metadata
+    pil_image = Image.open(BytesIO(image_bytes))
 
+    # Determine the input image format
+    if input_format is None:
+        input_format = pil_image.format
+        if input_format is None:
+            raise ValueError(
+                "Input image format could not be determined. "
+                "Please provide the 'input_format' parameter."
+            )
+
+    # Collect all metadata
+    info = pil_image.info.copy()
+
+    # Preserve XMP data if present
+    if 'XML:com.adobe.xmp' in pil_image.info:
+        info['xml'] = pil_image.info['XML:com.adobe.xmp']
+    elif 'xmp' in pil_image.info:
+        info['xmp'] = pil_image.info['xmp']
+
+    # Convert PIL image to OpenCV format (NumPy array)
+    frame_rgb = np.array(pil_image.convert('RGB'))
+
+    # Perform face detection
+    dets, _ = centerface(frame_rgb, threshold=threshold)
+
+    # Anonymize the frame
     anonymize_frame(
-        dets, frame, mask_scale=mask_scale,
-        replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-        replaceimg=replaceimg, mosaicsize=mosaicsize
+        dets,
+        frame_rgb,
+        mask_scale=mask_scale,
+        replacewith=replacewith,
+        ellipse=ellipse,
+        draw_scores=draw_scores,
+        replaceimg=replaceimg,
+        mosaicsize=mosaicsize
     )
 
+    # Convert back to PIL Image
+    anonymized_pil_image = Image.fromarray(frame_rgb)
+
+    # Display preview if enabled
     if enable_preview:
-        cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame[:, :, ::-1])  # RGB -> RGB
-        if cv2.waitKey(0) & 0xFF in [ord('q'), 27]:  # 27 is the escape key code
-            cv2.destroyAllWindows()
+        # Convert RGB to BGR for OpenCV display
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        cv2.imshow(
+            'Preview of anonymization results (press any key to close)',
+            frame_bgr
+        )
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
-    imageio.imsave(opath, frame)
-
+    # Save image to bytes
+    output_image_bytes_io = BytesIO()
+    save_kwargs = {}
     if keep_metadata:
-        # Save image with EXIF metadata
-        imageio.imsave(opath, frame, exif=exif_dict)
+        save_kwargs.update(info)
 
-    tqdm.write(f'Output saved to {opath}')
+    save_kwargs['format'] = input_format
+    save_kwargs['optimize'] = True
+
+    # Save the image using the specified format and parameters
+    anonymized_pil_image.save(output_image_bytes_io, **save_kwargs)
+
+    # Retrieve the bytes of the anonymized image
+    output_image_bytes = output_image_bytes_io.getvalue()
+
+    return output_image_bytes
 
 
 def get_file_type(path):
@@ -456,6 +718,9 @@ def get_anonymized_image(frame,
 
     return frame
 
+def read_file_as_bytes(file_path):
+    with open(file_path, 'rb') as f:
+        return f.read()
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(description='Video anonymization by face detection', add_help=False)
@@ -640,6 +905,7 @@ def main():
                 show_ffmpeg_config=show_ffmpeg_config,
                 show_ffmpeg_command=show_ffmpeg_command
             )
+
             # Check if args.distort_audio is allowed
             if stop_ffmpeg:
                 break  # exit the loop immediately if signal is received - second loop
@@ -649,9 +915,20 @@ def main():
             else:
                 tqdm.write("Skipping audio distortion.")
         elif filetype == 'image':
-            image_detect(
-                ipath=ipath,
-                opath=opath,
+
+            # Read image bytes
+            with open(ipath, 'rb') as f:
+                input_bytes = f.read()
+
+            # Determine the input image format based on file extension
+            input_extension = os.path.splitext(ipath)[1].lower()
+            input_format = Image.registered_extensions().get(input_extension)
+            if input_format is None:
+                # Default to 'JPEG' if format cannot be determined
+                input_format = 'JPEG'
+
+            output_image_bytes = image_detect(
+                image_bytes=input_bytes,
                 centerface=centerface,
                 threshold=threshold,
                 replacewith=replacewith,
@@ -661,10 +938,17 @@ def main():
                 enable_preview=enable_preview,
                 keep_metadata=keep_metadata,
                 replaceimg=replaceimg,
-                mosaicsize=mosaicsize
+                mosaicsize=mosaicsize,
+                input_format=input_format
             )
+
             if stop_ffmpeg:
                 break  # exit the loop immediately if signal is received - third loop
+
+            # Save output image
+            with open(opath, 'wb') as f:
+                f.write(output_image_bytes)
+
         elif filetype is None:
             tqdm.write(f'Can\'t determine file type of file {ipath}. Skipping...')
         elif filetype == 'notfound':
