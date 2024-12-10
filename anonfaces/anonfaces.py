@@ -472,7 +472,6 @@ def video_detect(
     bar.close()
 
     # After processing all frames, decide whether to write the anonymized video or return original
-    print(total_faces_detected)
     if total_faces_detected < min_faces:
         tqdm.write(f"Total faces detected ({total_faces_detected}) is less than {min_faces}. Returning original video.")
         # If user wants output, just copy the original input file to the output
