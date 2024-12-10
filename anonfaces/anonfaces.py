@@ -6,6 +6,7 @@ import mimetypes
 from typing import Dict, Tuple, Optional
 import shutil
 from io import BytesIO
+import shutil
 
 import skimage.draw
 import numpy as np
@@ -320,6 +321,7 @@ def video_detect(
         mosaicsize: int = 20,
         show_ffmpeg_config: bool = False,
         show_ffmpeg_command: bool = False,
+        min_faces: int = 4  # Add a parameter for the minimum number of faces
 ):
     metadata = get_video_metadata(ipath)
     if metadata is None:
@@ -400,11 +402,6 @@ def video_detect(
             _ffmpeg_config['audio_codec'] = 'aac'
             _ffmpeg_config['audio_bitrate'] = '128k'
 
-    # Prepare writer
-    writer = imageio.get_writer(
-        opath, format='FFMPEG', mode='I', **_ffmpeg_config
-    )
-
     if show_ffmpeg_config:
         tqdm.write(f'FFMPEG Config: {_ffmpeg_config}')
         tqdm.write("")
@@ -432,6 +429,9 @@ def video_detect(
         tqdm.write("")
 
     # Start processing frames
+    # variables for face counting
+    total_faces_detected = 0
+    processed_frames = []  # We'll store processed frames temporarily
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -445,16 +445,19 @@ def video_detect(
 
         dets, _ = centerface(frame_rgb, threshold=threshold)
 
-        anonymize_frame(
-            dets, frame_rgb, mask_scale=mask_scale,
-            replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-            replaceimg=replaceimg, mosaicsize=mosaicsize
-        )
+        # Count the faces detected in this frame
+        face_count = len(dets)
+        total_faces_detected += face_count
+
+        if face_count > 0:
+            anonymize_frame(
+                dets, frame_rgb, mask_scale=mask_scale,
+                replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
+                replaceimg=replaceimg, mosaicsize=mosaicsize
+            )
 
         frame_rgb = np.clip(frame_rgb, 0, 255).astype(np.uint8)
-
-        if opath is not None:
-            writer.append_data(frame_rgb)
+        processed_frames.append(frame_rgb)
 
         if enable_preview:
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
@@ -466,9 +469,24 @@ def video_detect(
         bar.update(1)
 
     cap.release()
-    if opath is not None:
-        writer.close()
     bar.close()
+
+    # After processing all frames, decide whether to write the anonymized video or return original
+    print(total_faces_detected)
+    if total_faces_detected < min_faces:
+        tqdm.write(f"Total faces detected ({total_faces_detected}) is less than {min_faces}. Returning original video.")
+        # If user wants output, just copy the original input file to the output
+        writer = None  # writer was never created before counting, so no need to close
+        # Just copy input to output
+        shutil.copy(ipath, opath)
+
+    else:
+        # We have enough faces, write the anonymized video now
+        # Prepare writer now that we know we want to produce anonymized output
+        writer = imageio.get_writer(opath, format='FFMPEG', mode='I', **_ffmpeg_config)
+        for f_rgb in processed_frames:
+            writer.append_data(f_rgb)
+        writer.close()
 
 
 EXTRACTED_AUDIO = "extracted_audio.wav"
@@ -586,7 +604,8 @@ def image_detect(
         keep_metadata: bool,
         replaceimg=None,
         mosaicsize: int = 20,
-        input_format: Optional[str] = None
+        input_format: Optional[str] = None,
+        min_faces: int = 1
 ):
     """
     Detects faces in an image and applies anonymization effects.
@@ -604,6 +623,7 @@ def image_detect(
     - replaceimg: Image to use for 'img' replacement (NumPy array or PIL Image).
     - mosaicsize: Size of mosaic blocks for 'mosaic' replacement.
     - input_format: The format of the input image (e.g., 'JPEG', 'PNG'). If None, it will be inferred.
+    - min_faces: The minimum number of faces that must be detected in the image. If the number of faces found is less than this value, the image will not be modified.
 
     Returns:
     - output_image_bytes: The anonymized image data in bytes.
@@ -634,6 +654,13 @@ def image_detect(
 
     # Perform face detection
     dets, _ = centerface(frame_rgb, threshold=threshold)
+
+    # Count the number of detected faces
+    face_count = len(dets)
+
+    # If the number of faces is below the desired threshold, return the original image
+    if face_count < min_faces:
+        return image_bytes
 
     # Anonymize the frame
     anonymize_frame(
@@ -820,82 +847,64 @@ def parse_cli_args():
     return args
 
 
-def main():
-    args = parse_cli_args()
-    ipaths = []
-
-    # add files in folders
-    for path in args.input:
-        if os.path.isdir(path):
-            for file in os.listdir(path):
-                ipaths.append(os.path.join(path,file))
-        else:
-            # Either a path to a regular file, the special 'cam' shortcut
-            # or an invalid path. The latter two cases are handled below.
-            ipaths.append(path)
-
-    base_opath = args.output
-    replacewith = args.replacewith
-    enable_preview = args.preview
-    draw_scores = args.draw_scores
-    threshold = args.thresh
-    ellipse = not args.boxes
-    mask_scale = args.mask_scale
-    keep_audio = args.keep_audio
-    copy_acodec = args.copy_acodec
-    ffmpeg_config = args.ffmpeg_config
-    show_ffmpeg_config = args.show_ffmpeg_config
-    show_ffmpeg_command = args.show_ffmpeg_command
-    backend = args.backend
-    in_shape = args.scale
-    execution_provider = args.execution_provider
-    mosaicsize = args.mosaicsize
-    keep_metadata = args.keep_metadata
-    replaceimg = None
-    if in_shape is not None:
-        w, h = in_shape.split('x')
-        in_shape = int(w), int(h)
-    if replacewith == "img":
-        replaceimg = imageio.imread(args.replaceimg)
-        print(f'After opening {args.replaceimg} shape: {replaceimg.shape}')
-
-
-    # TODO: scalar downscaling setting (-> in_shape), preserving aspect ratio
-    centerface = CenterFace(in_shape=in_shape, backend=backend, override_execution_provider=execution_provider)
-
-    multi_file = len(ipaths) > 1
+def process_inputs(
+        input_paths,
+        output,
+        thresh,
+        preview,
+        ellipse,
+        draw_scores,
+        mask_scale,
+        replacewith,
+        replaceimg,
+        mosaicsize,
+        distort_audio,
+        keep_audio,
+        copy_acodec,
+        show_ffmpeg_config,
+        show_ffmpeg_command,
+        ffmpeg_config,
+        centerface,
+        keep_metadata
+):
+    # If multiple inputs, show a batch progress bar
+    multi_file = len(input_paths) > 1
     if multi_file:
-        ipaths = tqdm(ipaths, position=0, dynamic_ncols=True, desc='Batch progress')
+        input_paths = tqdm(input_paths, position=0, dynamic_ncols=True, desc='Batch progress')
 
-    for ipath in ipaths:
+    for ipath in input_paths:
         if stop_ffmpeg:
-            break  # exit the loop immediately if signal is received
-        opath = base_opath
+            break
+        opath = output
+
+        is_cam = False
         if ipath == 'cam':
             ipath = '<video0>'
-            enable_preview = True
+            is_cam = True
+            preview = True
+
         filetype = get_file_type(ipath)
-        is_cam = filetype == 'cam'
         if opath is None and not is_cam:
             root, ext = os.path.splitext(ipath)
             opath = f'{root}_anon{ext}'
-        tqdm.write(f'Input:  {ipath}\nOutput: {opath}')
-        print()
-        if opath is None and not enable_preview:
-            tqdm.write('No output file is specified and the preview GUI is disabled. No output will be produced.')
 
-        if filetype == 'video' or is_cam:
+        tqdm.write(f'Input:  {ipath}\nOutput: {opath}\n')
+        if opath is None and not preview:
+            tqdm.write('No output file specified and preview disabled. No output will be produced.')
+
+        # Process videos
+        if filetype in ['video', 'cam']:
             video_detect(
                 ipath=ipath,
                 opath=opath,
                 centerface=centerface,
-                threshold=threshold,
+                threshold=thresh,
                 cam=is_cam,
                 replacewith=replacewith,
                 mask_scale=mask_scale,
                 ellipse=ellipse,
                 draw_scores=draw_scores,
-                enable_preview=enable_preview,
+                enable_preview=preview,
                 nested=multi_file,
                 keep_audio=keep_audio,
                 copy_acodec=copy_acodec,
@@ -905,37 +914,30 @@ def main():
                 show_ffmpeg_config=show_ffmpeg_config,
                 show_ffmpeg_command=show_ffmpeg_command
             )
-
-            # Check if args.distort_audio is allowed
             if stop_ffmpeg:
-                break  # exit the loop immediately if signal is received - second loop
-            if args.distort_audio:
+                break
+            if distort_audio:
                 tqdm.write("Distorting audio for the video...")
                 distort_now(ipath, opath)
             else:
                 tqdm.write("Skipping audio distortion.")
-        elif filetype == 'image':
 
-            # Read image bytes
+        # Process images
+        elif filetype == 'image':
             with open(ipath, 'rb') as f:
                 input_bytes = f.read()
-
-            # Determine the input image format based on file extension
             input_extension = os.path.splitext(ipath)[1].lower()
-            input_format = Image.registered_extensions().get(input_extension)
-            if input_format is None:
-                # Default to 'JPEG' if format cannot be determined
-                input_format = 'JPEG'
+            input_format = Image.registered_extensions().get(input_extension, 'JPEG')
 
             output_image_bytes = image_detect(
                 image_bytes=input_bytes,
                 centerface=centerface,
-                threshold=threshold,
+                threshold=thresh,
                 replacewith=replacewith,
                 mask_scale=mask_scale,
                 ellipse=ellipse,
                 draw_scores=draw_scores,
-                enable_preview=enable_preview,
+                enable_preview=preview,
                 keep_metadata=keep_metadata,
                 replaceimg=replaceimg,
                 mosaicsize=mosaicsize,
@@ -943,18 +945,124 @@ def main():
             )
 
             if stop_ffmpeg:
-                break  # exit the loop immediately if signal is received - third loop
+                break
 
-            # Save output image
             with open(opath, 'wb') as f:
                 f.write(output_image_bytes)
 
         elif filetype is None:
-            tqdm.write(f'Can\'t determine file type of file {ipath}. Skipping...')
+            tqdm.write(f'Cannot determine file type of file {ipath}. Skipping...')
         elif filetype == 'notfound':
             tqdm.write(f'File {ipath} not found. Skipping...')
         else:
             tqdm.write(f'File {ipath} has an unknown type {filetype}. Skipping...')
+
+
+def run_anonfaces(
+        input_paths,
+        output=None,
+        thresh=0.2,
+        scale=None,
+        preview=False,
+        boxes=False,
+        draw_scores=False,
+        mask_scale=1.3,
+        replacewith='blur',
+        replaceimg_path='replace_img.png',
+        mosaicsize=20,
+        distort_audio=False,
+        keep_audio=False,
+        copy_acodec=False,
+        show_ffmpeg_config=False,
+        show_ffmpeg_command=False,
+        ffmpeg_config={"codec": "libx264"},
+        backend='auto',
+        execution_provider=None,
+        keep_metadata=False
+):
+    in_shape = None
+    if scale is not None:
+        w, h = scale.split('x')
+        in_shape = (int(w), int(h))
+
+    replaceimg = None
+    if replacewith == "img":
+        replaceimg = imageio.imread(replaceimg_path)
+        print(f'After opening {replaceimg_path} shape: {replaceimg.shape}')
+
+    ellipse = not boxes
+    centerface = CenterFace(in_shape=in_shape, backend=backend, override_execution_provider=execution_provider)
+
+    process_inputs(
+        input_paths=input_paths,
+        output=output,
+        thresh=thresh,
+        preview=preview,
+        ellipse=ellipse,
+        draw_scores=draw_scores,
+        mask_scale=mask_scale,
+        replacewith=replacewith,
+        replaceimg=replaceimg,
+        mosaicsize=mosaicsize,
+        distort_audio=distort_audio,
+        keep_audio=keep_audio,
+        copy_acodec=copy_acodec,
+        show_ffmpeg_config=show_ffmpeg_config,
+        show_ffmpeg_command=show_ffmpeg_command,
+        ffmpeg_config=ffmpeg_config,
+        centerface=centerface,
+        keep_metadata=keep_metadata
+    )
+
+
+def main():
+    args = parse_cli_args()
+    # Prepare input paths
+    ipaths = []
+    for path in args.input:
+        if os.path.isdir(path):
+            for file in os.listdir(path):
+                ipaths.append(os.path.join(path, file))
+        else:
+            ipaths.append(path)
+
+    # Set up parameters from args
+    if args.scale is not None:
+        w, h = args.scale.split('x')
+        in_shape = (int(w), int(h))
+    else:
+        in_shape = None
+
+    replaceimg = None
+    if args.replacewith == "img":
+        replaceimg = imageio.imread(args.replaceimg)
+        print(f'After opening {args.replaceimg} shape: {replaceimg.shape}')
+
+    ellipse = not args.boxes
+
+    centerface = CenterFace(in_shape=in_shape, backend=args.backend,
+                            override_execution_provider=args.execution_provider)
+
+    process_inputs(
+        input_paths=ipaths,
+        output=args.output,
+        thresh=args.thresh,
+        preview=args.preview,
+        ellipse=ellipse,
+        draw_scores=args.draw_scores,
+        mask_scale=args.mask_scale,
+        replacewith=args.replacewith,
+        replaceimg=replaceimg,
+        mosaicsize=args.mosaicsize,
+        distort_audio=args.distort_audio,
+        keep_audio=args.keep_audio,
+        copy_acodec=args.copy_acodec,
+        show_ffmpeg_config=args.show_ffmpeg_config,
+        show_ffmpeg_command=args.show_ffmpeg_command,
+        ffmpeg_config=args.ffmpeg_config,
+        centerface=centerface,
+        keep_metadata=args.keep_metadata
+    )
 
 
 if __name__ == '__main__':
