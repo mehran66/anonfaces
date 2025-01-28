@@ -57,7 +57,9 @@ class CenterFace:
             #  CPUExecutionProvider as the last choice).
             #  In normal conditions, overriding this choice won't be necessary.
             available_providers = onnxruntime.get_available_providers()
-            ort_providers = [provider for provider in available_providers if provider != "TensorrtExecutionProvider"]
+            available_providers = [
+                provider for provider in available_providers if provider != "TensorrtExecutionProvider"
+            ]
             if override_execution_provider is None:
                 ort_providers = available_providers
             else:
