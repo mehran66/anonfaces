@@ -3,22 +3,21 @@
 import argparse
 import json
 import mimetypes
-from typing import Dict, Tuple, Optional
 import shutil
-from io import BytesIO
-import shutil
-
-import skimage.draw
-import numpy as np
-import imageio.plugins.ffmpeg
-import cv2
 import signal
+from io import BytesIO
+from typing import Dict, Optional, Tuple
+
+import cv2
+import ffmpeg
+import imageio.plugins.ffmpeg
+import numpy as np
+import skimage.draw
 from moviepy.editor import *
 from pedalboard import *
 from pedalboard.io import AudioFile
-from tqdm import tqdm
-import ffmpeg
 from PIL import Image
+from tqdm import tqdm
 
 try:
     from centerface import CenterFace  # Import when running as a standalone script
@@ -27,6 +26,7 @@ except ImportError:
 
 # Global flag to indicate when to stop processing
 stop_ffmpeg = False
+
 
 def signal_handler(signum, frame):
     """
@@ -40,8 +40,10 @@ def signal_handler(signum, frame):
     tqdm.write("Stop signal received, stopping cleanly...")
     tqdm.write("")  # Add another empty line for spacing
 
+
 # Register the signal handler for SIGINT (Ctrl+C)
 signal.signal(signal.SIGINT, signal_handler)
+
 
 def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
     """
@@ -75,17 +77,21 @@ def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
     # Round the coordinates to the nearest integer
     return np.round([x1, y1, x2, y2]).astype(int)
 
+
 def draw_det(
-        frame,
-        score,
-        det_idx,
-        x1, y1, x2, y2,
-        replacewith: str = 'blur',
-        ellipse: bool = True,
-        draw_scores: bool = False,
-        ovcolor: Tuple[int, int, int] = (0, 0, 0),
-        replaceimg=None,
-        mosaicsize: int = 20
+    frame,
+    score,
+    det_idx,
+    x1,
+    y1,
+    x2,
+    y2,
+    replacewith: str = "blur",
+    ellipse: bool = True,
+    draw_scores: bool = False,
+    ovcolor: Tuple[int, int, int] = (0, 0, 0),
+    replaceimg=None,
+    mosaicsize: int = 20,
 ):
     """
     Applies an anonymization effect to a detected bounding box in the frame.
@@ -106,27 +112,19 @@ def draw_det(
     Returns:
     - None. The function modifies the frame in place.
     """
-    if replacewith == 'solid':
+    if replacewith == "solid":
         # Draw a solid rectangle over the bounding box area with the specified color
         cv2.rectangle(frame, (x1, y1), (x2, y2), ovcolor, -1)
-    elif replacewith == 'blur':
+    elif replacewith == "blur":
         # Blur the bounding box area
         bf = 2  # Blur factor (number of pixels in each dimension that the face will be reduced to)
         # Apply blur to the ROI (Region of Interest)
-        blurred_box = cv2.blur(
-            frame[y1:y2, x1:x2],
-            (abs(x2 - x1) // bf, abs(y2 - y1) // bf)
-        )
+        blurred_box = cv2.blur(frame[y1:y2, x1:x2], (abs(x2 - x1) // bf, abs(y2 - y1) // bf))
         if ellipse:
             # If ellipse is True, apply the effect within an elliptical mask
             roibox = frame[y1:y2, x1:x2]
             # Get y and x coordinate lists of the "bounding ellipse"
-            ey, ex = skimage.draw.ellipse(
-                (y2 - y1) // 2,
-                (x2 - x1) // 2,
-                (y2 - y1) // 2,
-                (x2 - x1) // 2
-            )
+            ey, ex = skimage.draw.ellipse((y2 - y1) // 2, (x2 - x1) // 2, (y2 - y1) // 2, (x2 - x1) // 2)
             # Apply the blurred effect within the ellipse
             roibox[ey, ex] = blurred_box[ey, ex]
             # Update the frame with the modified ROI
@@ -134,7 +132,7 @@ def draw_det(
         else:
             # Replace the ROI in the frame with the blurred version
             frame[y1:y2, x1:x2] = blurred_box
-    elif replacewith == 'img':
+    elif replacewith == "img":
         # Replace the bounding box area with a provided image
         target_size = (x2 - x1, y2 - y1)
         # Resize the replacement image to match the target size
@@ -149,47 +147,25 @@ def draw_det(
             roi = frame[y1:y2, x1:x2]
             # Blend the replacement image with the ROI using the alpha channel
             frame[y1:y2, x1:x2] = roi * (1 - alpha_channel) + color_img * alpha_channel
-    elif replacewith == 'mosaic':
+    elif replacewith == "mosaic":
         # Apply a mosaic effect to the bounding box area
         for y in range(y1, y2, mosaicsize):
             for x in range(x1, x2, mosaicsize):
                 pt1 = (x, y)
-                pt2 = (
-                    min(x2, x + mosaicsize - 1),
-                    min(y2, y + mosaicsize - 1)
-                )
+                pt2 = (min(x2, x + mosaicsize - 1), min(y2, y + mosaicsize - 1))
                 # Get the color from the top-left pixel of the block
-                color = (
-                    int(frame[y, x][0]),
-                    int(frame[y, x][1]),
-                    int(frame[y, x][2])
-                )
+                color = (int(frame[y, x][0]), int(frame[y, x][1]), int(frame[y, x][2]))
                 # Draw the mosaic block with the selected color
                 cv2.rectangle(frame, pt1, pt2, color, -1)
-    elif replacewith == 'none':
+    elif replacewith == "none":
         # Do nothing; leave the bounding box area unchanged
         pass
     if draw_scores:
         # Draw the detection score near the bounding box
-        cv2.putText(
-            frame,
-            f'{score:.2f}',
-            (x1 + 0, y1 - 20),
-            cv2.FONT_HERSHEY_DUPLEX,
-            0.5,
-            (0, 255, 0)
-        )
+        cv2.putText(frame, f"{score:.2f}", (x1 + 0, y1 - 20), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 0))
 
-def anonymize_frame(
-        dets,
-        frame,
-        mask_scale,
-        replacewith,
-        ellipse,
-        draw_scores,
-        replaceimg,
-        mosaicsize
-):
+
+def anonymize_frame(dets, frame, mask_scale, replacewith, ellipse, draw_scores, replaceimg, mosaicsize):
     """
     Applies anonymization effects to detected faces in a frame.
 
@@ -231,7 +207,7 @@ def anonymize_frame(
             ellipse=ellipse,
             draw_scores=draw_scores,
             replaceimg=replaceimg,
-            mosaicsize=mosaicsize
+            mosaicsize=mosaicsize,
         )
 
 
@@ -249,6 +225,7 @@ def cam_read_iter(reader):
         # Yield the next frame from the reader
         yield reader.get_next_data()
 
+
 def get_video_metadata(ipath):
     """
     Retrieves metadata from a video file using FFmpeg.
@@ -265,10 +242,7 @@ def get_video_metadata(ipath):
         probe = ffmpeg.probe(ipath)
 
         # Extract video streams from the probe data
-        video_streams = [
-            stream for stream in probe['streams']
-            if stream['codec_type'] == 'video'
-        ]
+        video_streams = [stream for stream in probe["streams"] if stream["codec_type"] == "video"]
 
         if not video_streams:
             print(f"No video stream found in {ipath}")
@@ -279,21 +253,18 @@ def get_video_metadata(ipath):
 
         # Build the metadata dictionary
         metadata = {
-            'bit_rate': int(video_stream.get('bit_rate', 0)),
-            'pix_fmt': video_stream.get('pix_fmt', ''),
-            'width': int(video_stream.get('width', 0)),
-            'height': int(video_stream.get('height', 0)),
-            'codec_name': video_stream.get('codec_name', ''),
-            'avg_frame_rate': video_stream.get('avg_frame_rate', '0/0'),
-            'duration': float(video_stream.get('duration', 0.0)),
+            "bit_rate": int(video_stream.get("bit_rate", 0)),
+            "pix_fmt": video_stream.get("pix_fmt", ""),
+            "width": int(video_stream.get("width", 0)),
+            "height": int(video_stream.get("height", 0)),
+            "codec_name": video_stream.get("codec_name", ""),
+            "avg_frame_rate": video_stream.get("avg_frame_rate", "0/0"),
+            "duration": float(video_stream.get("duration", 0.0)),
         }
 
         # Check for audio streams
-        audio_streams = [
-            stream for stream in probe['streams']
-            if stream['codec_type'] == 'audio'
-        ]
-        metadata['has_audio'] = len(audio_streams) > 0
+        audio_streams = [stream for stream in probe["streams"] if stream["codec_type"] == "audio"]
+        metadata["has_audio"] = len(audio_streams) > 0
 
         return metadata
 
@@ -302,26 +273,27 @@ def get_video_metadata(ipath):
         print(f"Error retrieving metadata from {ipath}: {e.stderr.decode()}")
         return None
 
+
 def video_detect(
-        ipath: str,
-        opath: str,
-        centerface: CenterFace,
-        threshold: float,
-        enable_preview: bool,
-        cam: bool,
-        nested: bool,
-        replacewith: str,
-        mask_scale: float,
-        ellipse: bool,
-        draw_scores: bool,
-        ffmpeg_config: Dict[str, str],
-        replaceimg=None,
-        keep_audio: bool = False,
-        copy_acodec: bool = False,
-        mosaicsize: int = 20,
-        show_ffmpeg_config: bool = False,
-        show_ffmpeg_command: bool = False,
-        min_faces: int = 4  # Add a parameter for the minimum number of faces
+    ipath: str,
+    opath: str,
+    centerface: CenterFace,
+    threshold: float,
+    enable_preview: bool,
+    cam: bool,
+    nested: bool,
+    replacewith: str,
+    mask_scale: float,
+    ellipse: bool,
+    draw_scores: bool,
+    ffmpeg_config: Dict[str, str],
+    replaceimg=None,
+    keep_audio: bool = False,
+    copy_acodec: bool = False,
+    mosaicsize: int = 20,
+    show_ffmpeg_config: bool = False,
+    show_ffmpeg_command: bool = False,
+    min_faces: int = 4,  # Add a parameter for the minimum number of faces
 ):
     metadata = get_video_metadata(ipath)
     if metadata is None:
@@ -329,9 +301,9 @@ def video_detect(
         return
 
     # Extract metadata values
-    bit_rate = metadata['bit_rate']
-    pix_fmt = metadata['pix_fmt']
-    has_audio = metadata['has_audio']
+    bit_rate = metadata["bit_rate"]
+    pix_fmt = metadata["pix_fmt"]
+    has_audio = metadata["has_audio"]
 
     # Handle camera input
     if cam:
@@ -341,9 +313,9 @@ def video_detect(
 
     if not cap.isOpened():
         if cam:
-            tqdm.write(f'Could not open camera device. Please check your camera connection.')
+            tqdm.write(f"Could not open camera device. Please check your camera connection.")
         else:
-            tqdm.write(f'Could not open file {ipath} as a video file with OpenCV. Skipping file...')
+            tqdm.write(f"Could not open file {ipath} as a video file with OpenCV. Skipping file...")
         return
 
     try:
@@ -353,7 +325,7 @@ def video_detect(
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     except Exception as e:
-        tqdm.write(f'Error retrieving video properties: {e}')
+        tqdm.write(f"Error retrieving video properties: {e}")
         return
 
     if fps <= 0 or fps > 120:
@@ -367,43 +339,48 @@ def video_detect(
 
     # Prepare ffmpeg_config
     _ffmpeg_config = ffmpeg_config.copy()
-    _ffmpeg_config['fps'] = fps
-    _ffmpeg_config.setdefault('ffmpeg_log_level', 'panic')
-    _ffmpeg_config.setdefault('ffmpeg_params', [])
-    _ffmpeg_config['ffmpeg_params'].extend(['-map_metadata', '0', '-map', '0'])
+    _ffmpeg_config["fps"] = fps
+    _ffmpeg_config.setdefault("ffmpeg_log_level", "panic")
+    _ffmpeg_config.setdefault("ffmpeg_params", [])
+    _ffmpeg_config["ffmpeg_params"].extend(["-map_metadata", "0", "-map", "0"])
 
-    common_pix_fmts = ['yuv420p', 'yuvj420p', 'nv12']
+    common_pix_fmts = ["yuv420p", "yuvj420p", "nv12"]
     if pix_fmt in common_pix_fmts:
-        _ffmpeg_config['ffmpeg_params'].extend(['-pix_fmt', pix_fmt])
+        _ffmpeg_config["ffmpeg_params"].extend(["-pix_fmt", pix_fmt])
     else:
-        _ffmpeg_config['ffmpeg_params'].extend(['-pix_fmt', 'yuv420p'])
+        _ffmpeg_config["ffmpeg_params"].extend(["-pix_fmt", "yuv420p"])
 
     if bit_rate:
         bitrate_kbps = bit_rate // 1000
-        _ffmpeg_config['bitrate'] = f'{bitrate_kbps}k'
+        _ffmpeg_config["bitrate"] = f"{bitrate_kbps}k"
     else:
         # Set default bitrate if extraction fails
-        _ffmpeg_config['bitrate'] = '2000k'
+        _ffmpeg_config["bitrate"] = "2000k"
 
     # Adjust Encoding Settings
-    _ffmpeg_config['codec'] = 'libx264'  # Ensure using H.264 codec
-    _ffmpeg_config['ffmpeg_params'].extend([
-        '-preset', 'slow',
-        '-profile:v', 'baseline',  # Match input video's profile
-        '-level', '3.1',           # Set level if needed
-    ])
+    _ffmpeg_config["codec"] = "libx264"  # Ensure using H.264 codec
+    _ffmpeg_config["ffmpeg_params"].extend(
+        [
+            "-preset",
+            "slow",
+            "-profile:v",
+            "baseline",  # Match input video's profile
+            "-level",
+            "3.1",  # Set level if needed
+        ]
+    )
 
     # Handle audio settings
     if keep_audio and has_audio:
-        _ffmpeg_config['audio_path'] = ipath
+        _ffmpeg_config["audio_path"] = ipath
         if copy_acodec:
-            _ffmpeg_config['audio_codec'] = 'copy'
+            _ffmpeg_config["audio_codec"] = "copy"
         else:
-            _ffmpeg_config['audio_codec'] = 'aac'
-            _ffmpeg_config['audio_bitrate'] = '128k'
+            _ffmpeg_config["audio_codec"] = "aac"
+            _ffmpeg_config["audio_bitrate"] = "128k"
 
     if show_ffmpeg_config:
-        tqdm.write(f'FFMPEG Config: {_ffmpeg_config}')
+        tqdm.write(f"FFMPEG Config: {_ffmpeg_config}")
         tqdm.write("")
 
     # Construct and display FFmpeg command
@@ -412,17 +389,17 @@ def video_detect(
             f"ffmpeg -y -loglevel {_ffmpeg_config['ffmpeg_log_level']} "
             f"-f rawvideo -vcodec rawvideo -s {frame_width}x{frame_height} -pix_fmt rgb24 -r {_ffmpeg_config['fps']} -i - "
         )
-        if 'audio_path' in _ffmpeg_config:
+        if "audio_path" in _ffmpeg_config:
             ffmpeg_command += f"-i {_ffmpeg_config['audio_path']} "
         ffmpeg_command += f"-an -vcodec {_ffmpeg_config['codec']} "
-        if 'bitrate' in _ffmpeg_config:
+        if "bitrate" in _ffmpeg_config:
             ffmpeg_command += f"-b:v {_ffmpeg_config['bitrate']} "
-        if 'ffmpeg_params' in _ffmpeg_config:
-            params = ' '.join(_ffmpeg_config['ffmpeg_params'])
+        if "ffmpeg_params" in _ffmpeg_config:
+            params = " ".join(_ffmpeg_config["ffmpeg_params"])
             ffmpeg_command += f"{params} "
-        if 'audio_codec' in _ffmpeg_config:
+        if "audio_codec" in _ffmpeg_config:
             ffmpeg_command += f"-c:a {_ffmpeg_config['audio_codec']} "
-            if 'audio_bitrate' in _ffmpeg_config:
+            if "audio_bitrate" in _ffmpeg_config:
                 ffmpeg_command += f"-b:a {_ffmpeg_config['audio_bitrate']} "
         ffmpeg_command += f"{opath}"
         tqdm.write(f"FFMPEG Command: {ffmpeg_command}")
@@ -451,9 +428,14 @@ def video_detect(
 
         if face_count > 0:
             anonymize_frame(
-                dets, frame_rgb, mask_scale=mask_scale,
-                replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-                replaceimg=replaceimg, mosaicsize=mosaicsize
+                dets,
+                frame_rgb,
+                mask_scale=mask_scale,
+                replacewith=replacewith,
+                ellipse=ellipse,
+                draw_scores=draw_scores,
+                replaceimg=replaceimg,
+                mosaicsize=mosaicsize,
             )
 
         frame_rgb = np.clip(frame_rgb, 0, 255).astype(np.uint8)
@@ -461,8 +443,8 @@ def video_detect(
 
         if enable_preview:
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            cv2.imshow('Preview of anonymization results (quit by pressing Q or Escape)', frame_bgr)
-            if cv2.waitKey(1) & 0xFF in [ord('q'), 27]:
+            cv2.imshow("Preview of anonymization results (quit by pressing Q or Escape)", frame_bgr)
+            if cv2.waitKey(1) & 0xFF in [ord("q"), 27]:
                 cv2.destroyAllWindows()
                 break
 
@@ -482,7 +464,7 @@ def video_detect(
     else:
         # We have enough faces, write the anonymized video now
         # Prepare writer now that we know we want to produce anonymized output
-        writer = imageio.get_writer(opath, format='FFMPEG', mode='I', **_ffmpeg_config)
+        writer = imageio.get_writer(opath, format="FFMPEG", mode="I", **_ffmpeg_config)
         for f_rgb in processed_frames:
             writer.append_data(f_rgb)
         writer.close()
@@ -506,6 +488,7 @@ def extract_audio_from_video(v_path: str, a_path: str):
     video = VideoFileClip(v_path)
     video.audio.write_audiofile(a_path)
 
+
 def distort_audio(audio_input: str, audio_output: str, sample_rate: float = 44100.0):
     """
     Applies distortion effects to an audio file and saves the processed audio.
@@ -523,16 +506,18 @@ def distort_audio(audio_input: str, audio_output: str, sample_rate: float = 4410
         audio = f.read(f.frames)
 
     # Define the audio effects to apply
-    board = Pedalboard([
-        Gain(gain_db=5),
-        PitchShift(semitones=-2.5),
-    ])
+    board = Pedalboard(
+        [
+            Gain(gain_db=5),
+            PitchShift(semitones=-2.5),
+        ]
+    )
 
     # Apply the effects to the audio
     d_audio = board(audio, sample_rate)
 
     # Write the processed audio to the output file
-    with AudioFile(audio_output, 'w', sample_rate, d_audio.shape[0]) as f:
+    with AudioFile(audio_output, "w", sample_rate, d_audio.shape[0]) as f:
         f.write(d_audio)
 
 
@@ -592,19 +577,19 @@ def distort_now(ipath: str, opath: str):
 
 
 def image_detect(
-        image_bytes: bytes,
-        centerface: CenterFace,
-        threshold: float,
-        replacewith: str,
-        mask_scale: float,
-        ellipse: bool,
-        draw_scores: bool,
-        enable_preview: bool,
-        keep_metadata: bool,
-        replaceimg=None,
-        mosaicsize: int = 20,
-        input_format: Optional[str] = None,
-        min_faces: int = 1
+    image_bytes: bytes,
+    centerface: CenterFace,
+    threshold: float,
+    replacewith: str,
+    mask_scale: float,
+    ellipse: bool,
+    draw_scores: bool,
+    enable_preview: bool,
+    keep_metadata: bool,
+    replaceimg=None,
+    mosaicsize: int = 20,
+    input_format: Optional[str] = None,
+    min_faces: int = 1,
 ):
     """
     Detects faces in an image and applies anonymization effects.
@@ -634,22 +619,19 @@ def image_detect(
     if input_format is None:
         input_format = pil_image.format
         if input_format is None:
-            raise ValueError(
-                "Input image format could not be determined. "
-                "Please provide the 'input_format' parameter."
-            )
+            raise ValueError("Input image format could not be determined. Please provide the 'input_format' parameter.")
 
     # Collect all metadata
     info = pil_image.info.copy()
 
     # Preserve XMP data if present
-    if 'XML:com.adobe.xmp' in pil_image.info:
-        info['xml'] = pil_image.info['XML:com.adobe.xmp']
-    elif 'xmp' in pil_image.info:
-        info['xmp'] = pil_image.info['xmp']
+    if "XML:com.adobe.xmp" in pil_image.info:
+        info["xml"] = pil_image.info["XML:com.adobe.xmp"]
+    elif "xmp" in pil_image.info:
+        info["xmp"] = pil_image.info["xmp"]
 
     # Convert PIL image to OpenCV format (NumPy array)
-    frame_rgb = np.array(pil_image.convert('RGB'))
+    frame_rgb = np.array(pil_image.convert("RGB"))
 
     # Perform face detection
     dets, _ = centerface(frame_rgb, threshold=threshold)
@@ -670,7 +652,7 @@ def image_detect(
         ellipse=ellipse,
         draw_scores=draw_scores,
         replaceimg=replaceimg,
-        mosaicsize=mosaicsize
+        mosaicsize=mosaicsize,
     )
 
     # Convert back to PIL Image
@@ -680,10 +662,7 @@ def image_detect(
     if enable_preview:
         # Convert RGB to BGR for OpenCV display
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        cv2.imshow(
-            'Preview of anonymization results (press any key to close)',
-            frame_bgr
-        )
+        cv2.imshow("Preview of anonymization results (press any key to close)", frame_bgr)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
@@ -693,8 +672,8 @@ def image_detect(
     if keep_metadata:
         save_kwargs.update(info)
 
-    save_kwargs['format'] = input_format
-    save_kwargs['optimize'] = True
+    save_kwargs["format"] = input_format
+    save_kwargs["optimize"] = True
 
     # Save the image using the specified format and parameters
     anonymized_pil_image.save(output_image_bytes_io, **save_kwargs)
@@ -706,118 +685,177 @@ def image_detect(
 
 
 def get_file_type(path):
-    if path.startswith('<video'):
-        return 'cam'
+    if path.startswith("<video"):
+        return "cam"
     if not os.path.isfile(path):
-        return 'notfound'
+        return "notfound"
     mime = mimetypes.guess_type(path)[0]
     if mime is None:
         return None
-    if mime.startswith('video'):
-        return 'video'
-    if mime.startswith('image'):
-        return 'image'
+    if mime.startswith("video"):
+        return "video"
+    if mime.startswith("image"):
+        return "image"
     return mime
 
 
-def get_anonymized_image(frame,
-                         threshold: float,
-                         replacewith: str,
-                         mask_scale: float,
-                         ellipse: bool,
-                         draw_scores: bool,
-                         replaceimg = None
-                         ):
+def get_anonymized_image(
+    frame, threshold: float, replacewith: str, mask_scale: float, ellipse: bool, draw_scores: bool, replaceimg=None
+):
     """
     Method for getting an anonymized image without CLI
     returns frame
     """
 
-    centerface = CenterFace(in_shape=None, backend='auto')
+    centerface = CenterFace(in_shape=None, backend="auto")
     dets, _ = centerface(frame, threshold=threshold)
 
     anonymize_frame(
-        dets, frame, mask_scale=mask_scale,
-        replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-        replaceimg=replaceimg
+        dets,
+        frame,
+        mask_scale=mask_scale,
+        replacewith=replacewith,
+        ellipse=ellipse,
+        draw_scores=draw_scores,
+        replaceimg=replaceimg,
     )
 
     return frame
 
+
 def read_file_as_bytes(file_path):
-    with open(file_path, 'rb') as f:
+    with open(file_path, "rb") as f:
         return f.read()
 
+
 def parse_cli_args():
-    parser = argparse.ArgumentParser(description='Video anonymization by face detection', add_help=False)
+    parser = argparse.ArgumentParser(description="Video anonymization by face detection", add_help=False)
     parser.add_argument(
-        'input', nargs='*',
-        help=f'File path(s) or camera device name. It is possible to pass multiple paths by separating them by spaces or by using shell expansion (e.g. `$ anonfaces vids/*.mp4`). Alternatively, you can pass a directory as an input, in which case all files in the directory will be used as inputs. If a camera is installed, a live webcam demo can be started by running `$ anonfaces cam` (which is a shortcut for `$ anonfaces -p \'<video0>\'`.')
-    parser.add_argument(
-        '--output', '-o', default=None, metavar='O',
-        help='Output file name. Defaults to input path + postfix "_anonymized".')
-    parser.add_argument(
-        '--thresh', '-t', default=0.2, type=float, metavar='T',
-        help='Detection threshold (tune this to trade off between false positive and false negative rate). Default: 0.2.')
-    parser.add_argument(
-        '--scale', '-s', default=None, metavar='WxH',
-        help='Downscale images for network inference to this size (format: WxH, example: --scale 640x360).')
-    parser.add_argument(
-        '--preview', '-p', default=False, action='store_true',
-        help='Enable live preview GUI (can decrease performance).')
-    parser.add_argument(
-        '--boxes', default=False, action='store_true',
-        help='Use boxes instead of ellipse masks.')
-    parser.add_argument(
-        '--draw-scores', default=False, action='store_true',
-        help='Draw detection scores onto outputs.')
-    parser.add_argument(
-        '--mask-scale', default=1.3, type=float, metavar='M',
-        help='Scale factor for face masks, to make sure that masks cover the complete face. Default: 1.3.')
-    parser.add_argument(
-        '--replacewith', default='blur', choices=['blur', 'solid', 'none', 'img', 'mosaic'],
-        help='Anonymization filter mode for face regions. "blur" applies a strong gaussian blurring, "solid" draws a solid black box, "none" does leaves the input unchanged, "img" replaces the face with a custom image and "mosaic" replaces the face with mosaic. Default: "blur".')
-    parser.add_argument(
-        '--replaceimg', default='replace_img.png',
-        help='Anonymization image for face regions. Requires --replacewith img option.')
-    parser.add_argument(
-        '--mosaicsize', default=20, type=int, metavar='width',
-        help='Setting the mosaic size. Requires --replacewith mosaic option. Default: 20.')
-    parser.add_argument(
-        '--distort-audio', '-da', default=False, action='store_true',
-        help='Enable audio distortion for the output video (applies pitch shift and gain effects to the audio). This automatically applies --keep-audio but will not work with --copy-acodec due to MoviePy')
-    parser.add_argument(
-        '--keep-audio', '-k', default=False, action='store_true',
-        help='Keep audio from video source file and copy it over to the output (only applies to videos).')
-    parser.add_argument(
-        '--copy-acodec', '-ca', default=False, action='store_true',
-        help='Keep audio codec from video source file.')
-    parser.add_argument(
-        '--show-ffmpeg-config', '-config', action='store_true', default=False,
-        help='Shows the FFmpeg config arguments string.'
+        "input",
+        nargs="*",
+        help=f"File path(s) or camera device name. It is possible to pass multiple paths by separating them by spaces or by using shell expansion (e.g. `$ anonfaces vids/*.mp4`). Alternatively, you can pass a directory as an input, in which case all files in the directory will be used as inputs. If a camera is installed, a live webcam demo can be started by running `$ anonfaces cam` (which is a shortcut for `$ anonfaces -p '<video0>'`.",
     )
     parser.add_argument(
-        '--show-ffmpeg-command', '-command', action='store_true', default=False,
-        help='Shows the FFmpeg constructed command used for processing the video. Helpful for troublshooting.'
+        "--output",
+        "-o",
+        default=None,
+        metavar="O",
+        help='Output file name. Defaults to input path + postfix "_anonymized".',
     )
     parser.add_argument(
-        '--show-both', '-both', action='store_true', default=False,
-        help='Shows both --show-ffmpeg-command & --show-ffmpeg-config'
+        "--thresh",
+        "-t",
+        default=0.2,
+        type=float,
+        metavar="T",
+        help="Detection threshold (tune this to trade off between false positive and false negative rate). Default: 0.2.",
     )
     parser.add_argument(
-        '--ffmpeg-config', default={"codec": "libx264"}, type=json.loads,
-        help='FFMPEG config arguments for encoding output videos. This argument is expected in JSON notation. For a list of possible options, refer to the ffmpeg-imageio docs. Default: \'{"codec": "libx264"}\'.'
+        "--scale",
+        "-s",
+        default=None,
+        metavar="WxH",
+        help="Downscale images for network inference to this size (format: WxH, example: --scale 640x360).",
+    )
+    parser.add_argument(
+        "--preview",
+        "-p",
+        default=False,
+        action="store_true",
+        help="Enable live preview GUI (can decrease performance).",
+    )
+    parser.add_argument("--boxes", default=False, action="store_true", help="Use boxes instead of ellipse masks.")
+    parser.add_argument("--draw-scores", default=False, action="store_true", help="Draw detection scores onto outputs.")
+    parser.add_argument(
+        "--mask-scale",
+        default=1.3,
+        type=float,
+        metavar="M",
+        help="Scale factor for face masks, to make sure that masks cover the complete face. Default: 1.3.",
+    )
+    parser.add_argument(
+        "--replacewith",
+        default="blur",
+        choices=["blur", "solid", "none", "img", "mosaic"],
+        help='Anonymization filter mode for face regions. "blur" applies a strong gaussian blurring, "solid" draws a solid black box, "none" does leaves the input unchanged, "img" replaces the face with a custom image and "mosaic" replaces the face with mosaic. Default: "blur".',
+    )
+    parser.add_argument(
+        "--replaceimg",
+        default="replace_img.png",
+        help="Anonymization image for face regions. Requires --replacewith img option.",
+    )
+    parser.add_argument(
+        "--mosaicsize",
+        default=20,
+        type=int,
+        metavar="width",
+        help="Setting the mosaic size. Requires --replacewith mosaic option. Default: 20.",
+    )
+    parser.add_argument(
+        "--distort-audio",
+        "-da",
+        default=False,
+        action="store_true",
+        help="Enable audio distortion for the output video (applies pitch shift and gain effects to the audio). This automatically applies --keep-audio but will not work with --copy-acodec due to MoviePy",
+    )
+    parser.add_argument(
+        "--keep-audio",
+        "-k",
+        default=False,
+        action="store_true",
+        help="Keep audio from video source file and copy it over to the output (only applies to videos).",
+    )
+    parser.add_argument(
+        "--copy-acodec", "-ca", default=False, action="store_true", help="Keep audio codec from video source file."
+    )
+    parser.add_argument(
+        "--show-ffmpeg-config",
+        "-config",
+        action="store_true",
+        default=False,
+        help="Shows the FFmpeg config arguments string.",
+    )
+    parser.add_argument(
+        "--show-ffmpeg-command",
+        "-command",
+        action="store_true",
+        default=False,
+        help="Shows the FFmpeg constructed command used for processing the video. Helpful for troublshooting.",
+    )
+    parser.add_argument(
+        "--show-both",
+        "-both",
+        action="store_true",
+        default=False,
+        help="Shows both --show-ffmpeg-command & --show-ffmpeg-config",
+    )
+    parser.add_argument(
+        "--ffmpeg-config",
+        default={"codec": "libx264"},
+        type=json.loads,
+        help='FFMPEG config arguments for encoding output videos. This argument is expected in JSON notation. For a list of possible options, refer to the ffmpeg-imageio docs. Default: \'{"codec": "libx264"}\'.',
     )  # See https://imageio.readthedocs.io/en/stable/format_ffmpeg.html#parameters-for-saving
     parser.add_argument(
-        '--backend', default='auto', choices=['auto', 'onnxrt', 'opencv'],
-        help='Backend for ONNX model execution. Default: "auto" (prefer onnxrt if available).')
+        "--backend",
+        default="auto",
+        choices=["auto", "onnxrt", "opencv"],
+        help='Backend for ONNX model execution. Default: "auto" (prefer onnxrt if available).',
+    )
     parser.add_argument(
-        '--execution-provider', '--ep', default=None, metavar='EP',
-        help='Override onnxrt execution provider (see https://onnxruntime.ai/docs/execution-providers/). If not specified, the presumably fastest available one will be automatically selected. Only used if backend is onnxrt.')
+        "--execution-provider",
+        "--ep",
+        default=None,
+        metavar="EP",
+        help="Override onnxrt execution provider (see https://onnxruntime.ai/docs/execution-providers/). If not specified, the presumably fastest available one will be automatically selected. Only used if backend is onnxrt.",
+    )
     parser.add_argument(
-        '--keep-metadata', '-m', default=False, action='store_true',
-        help='Keep metadata of the original image. Default : False.')
-    parser.add_argument('--help', '-h', action='help', help='Show this help message and exit.')
+        "--keep-metadata",
+        "-m",
+        default=False,
+        action="store_true",
+        help="Keep metadata of the original image. Default : False.",
+    )
+    parser.add_argument("--help", "-h", action="help", help="Show this help message and exit.")
 
     args = parser.parse_args()
 
@@ -836,40 +874,40 @@ def parse_cli_args():
 
     if len(args.input) == 0:
         parser.print_help()
-        tqdm.write('\nPlease supply at least one input path.')
+        tqdm.write("\nPlease supply at least one input path.")
         exit(1)
 
-    if args.input == ['cam']:  # Shortcut for webcam demo with live preview
-        args.input = ['<video0>']
+    if args.input == ["cam"]:  # Shortcut for webcam demo with live preview
+        args.input = ["<video0>"]
         args.preview = True
 
     return args
 
 
 def process_inputs(
-        input_paths,
-        output,
-        thresh,
-        preview,
-        ellipse,
-        draw_scores,
-        mask_scale,
-        replacewith,
-        replaceimg,
-        mosaicsize,
-        distort_audio,
-        keep_audio,
-        copy_acodec,
-        show_ffmpeg_config,
-        show_ffmpeg_command,
-        ffmpeg_config,
-        centerface,
-        keep_metadata
+    input_paths,
+    output,
+    thresh,
+    preview,
+    ellipse,
+    draw_scores,
+    mask_scale,
+    replacewith,
+    replaceimg,
+    mosaicsize,
+    distort_audio,
+    keep_audio,
+    copy_acodec,
+    show_ffmpeg_config,
+    show_ffmpeg_command,
+    ffmpeg_config,
+    centerface,
+    keep_metadata,
 ):
     # If multiple inputs, show a batch progress bar
     multi_file = len(input_paths) > 1
     if multi_file:
-        input_paths = tqdm(input_paths, position=0, dynamic_ncols=True, desc='Batch progress')
+        input_paths = tqdm(input_paths, position=0, dynamic_ncols=True, desc="Batch progress")
 
     for ipath in input_paths:
         if stop_ffmpeg:
@@ -877,22 +915,22 @@ def process_inputs(
         opath = output
 
         is_cam = False
-        if ipath == 'cam':
-            ipath = '<video0>'
+        if ipath == "cam":
+            ipath = "<video0>"
             is_cam = True
             preview = True
 
         filetype = get_file_type(ipath)
         if opath is None and not is_cam:
             root, ext = os.path.splitext(ipath)
-            opath = f'{root}_anon{ext}'
+            opath = f"{root}_anon{ext}"
 
-        tqdm.write(f'Input:  {ipath}\nOutput: {opath}\n')
+        tqdm.write(f"Input:  {ipath}\nOutput: {opath}\n")
         if opath is None and not preview:
-            tqdm.write('No output file specified and preview disabled. No output will be produced.')
+            tqdm.write("No output file specified and preview disabled. No output will be produced.")
 
         # Process videos
-        if filetype in ['video', 'cam']:
+        if filetype in ["video", "cam"]:
             video_detect(
                 ipath=ipath,
                 opath=opath,
@@ -911,7 +949,7 @@ def process_inputs(
                 replaceimg=replaceimg,
                 mosaicsize=mosaicsize,
                 show_ffmpeg_config=show_ffmpeg_config,
-                show_ffmpeg_command=show_ffmpeg_command
+                show_ffmpeg_command=show_ffmpeg_command,
             )
             if stop_ffmpeg:
                 break
@@ -922,11 +960,11 @@ def process_inputs(
                 tqdm.write("Skipping audio distortion.")
 
         # Process images
-        elif filetype == 'image':
-            with open(ipath, 'rb') as f:
+        elif filetype == "image":
+            with open(ipath, "rb") as f:
                 input_bytes = f.read()
             input_extension = os.path.splitext(ipath)[1].lower()
-            input_format = Image.registered_extensions().get(input_extension, 'JPEG')
+            input_format = Image.registered_extensions().get(input_extension, "JPEG")
 
             output_image_bytes = image_detect(
                 image_bytes=input_bytes,
@@ -940,54 +978,54 @@ def process_inputs(
                 keep_metadata=keep_metadata,
                 replaceimg=replaceimg,
                 mosaicsize=mosaicsize,
-                input_format=input_format
+                input_format=input_format,
             )
 
             if stop_ffmpeg:
                 break
 
-            with open(opath, 'wb') as f:
+            with open(opath, "wb") as f:
                 f.write(output_image_bytes)
 
         elif filetype is None:
-            tqdm.write(f'Cannot determine file type of file {ipath}. Skipping...')
-        elif filetype == 'notfound':
-            tqdm.write(f'File {ipath} not found. Skipping...')
+            tqdm.write(f"Cannot determine file type of file {ipath}. Skipping...")
+        elif filetype == "notfound":
+            tqdm.write(f"File {ipath} not found. Skipping...")
         else:
-            tqdm.write(f'File {ipath} has an unknown type {filetype}. Skipping...')
+            tqdm.write(f"File {ipath} has an unknown type {filetype}. Skipping...")
 
 
 def run_anonfaces(
-        input_paths,
-        output=None,
-        thresh=0.2,
-        scale=None,
-        preview=False,
-        boxes=False,
-        draw_scores=False,
-        mask_scale=1.3,
-        replacewith='blur',
-        replaceimg_path='replace_img.png',
-        mosaicsize=20,
-        distort_audio=False,
-        keep_audio=False,
-        copy_acodec=False,
-        show_ffmpeg_config=False,
-        show_ffmpeg_command=False,
-        ffmpeg_config={"codec": "libx264"},
-        backend='auto',
-        execution_provider=None,
-        keep_metadata=False
+    input_paths,
+    output=None,
+    thresh=0.2,
+    scale=None,
+    preview=False,
+    boxes=False,
+    draw_scores=False,
+    mask_scale=1.3,
+    replacewith="blur",
+    replaceimg_path="replace_img.png",
+    mosaicsize=20,
+    distort_audio=False,
+    keep_audio=False,
+    copy_acodec=False,
+    show_ffmpeg_config=False,
+    show_ffmpeg_command=False,
+    ffmpeg_config={"codec": "libx264"},
+    backend="auto",
+    execution_provider=None,
+    keep_metadata=False,
 ):
     in_shape = None
     if scale is not None:
-        w, h = scale.split('x')
+        w, h = scale.split("x")
         in_shape = (int(w), int(h))
 
     replaceimg = None
     if replacewith == "img":
         replaceimg = imageio.imread(replaceimg_path)
-        print(f'After opening {replaceimg_path} shape: {replaceimg.shape}')
+        print(f"After opening {replaceimg_path} shape: {replaceimg.shape}")
 
     ellipse = not boxes
     centerface = CenterFace(in_shape=in_shape, backend=backend, override_execution_provider=execution_provider)
@@ -1010,7 +1048,7 @@ def run_anonfaces(
         show_ffmpeg_command=show_ffmpeg_command,
         ffmpeg_config=ffmpeg_config,
         centerface=centerface,
-        keep_metadata=keep_metadata
+        keep_metadata=keep_metadata,
     )
 
 
@@ -1027,7 +1065,7 @@ def main():
 
     # Set up parameters from args
     if args.scale is not None:
-        w, h = args.scale.split('x')
+        w, h = args.scale.split("x")
         in_shape = (int(w), int(h))
     else:
         in_shape = None
@@ -1035,12 +1073,13 @@ def main():
     replaceimg = None
     if args.replacewith == "img":
         replaceimg = imageio.imread(args.replaceimg)
-        print(f'After opening {args.replaceimg} shape: {replaceimg.shape}')
+        print(f"After opening {args.replaceimg} shape: {replaceimg.shape}")
 
     ellipse = not args.boxes
 
-    centerface = CenterFace(in_shape=in_shape, backend=args.backend,
-                            override_execution_provider=args.execution_provider)
+    centerface = CenterFace(
+        in_shape=in_shape, backend=args.backend, override_execution_provider=args.execution_provider
+    )
 
     process_inputs(
         input_paths=ipaths,
@@ -1060,9 +1099,9 @@ def main():
         show_ffmpeg_command=args.show_ffmpeg_command,
         ffmpeg_config=args.ffmpeg_config,
         centerface=centerface,
-        keep_metadata=args.keep_metadata
+        keep_metadata=args.keep_metadata,
     )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
